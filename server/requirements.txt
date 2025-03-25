@@ -1,0 +1,2 @@
+flwr==1.11.1  # Adjust version as needed
+numpy  # or other dependencies your script requires

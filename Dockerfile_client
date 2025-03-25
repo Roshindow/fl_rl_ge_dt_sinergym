@@ -1,0 +1,234 @@
+# ---------------------------------------------------------------------------- #
+#                                  BASE IMAGE                                  #
+# ---------------------------------------------------------------------------- #
+
+ARG UBUNTU_VERSION=24.04
+FROM ubuntu:${UBUNTU_VERSION}
+
+# ---------------------------------------------------------------------------- #
+#                      CONTAINER ARGUMENTS AND ENV CONFIG                      #
+# ---------------------------------------------------------------------------- #
+
+# -------------------------------- ENERGYPLUS -------------------------------- #
+
+# VERSION ARGUMENTS
+ARG ENERGYPLUS_VERSION=24.1.0
+ARG ENERGYPLUS_INSTALL_VERSION=24-1-0
+ARG ENERGYPLUS_SHA=9d7789a3ac
+
+#ENV CONFIGURATION
+ENV ENERGYPLUS_TAG=v$ENERGYPLUS_VERSION
+ENV EPLUS_PATH=/usr/local/EnergyPlus-$ENERGYPLUS_INSTALL_VERSION
+# Downloading from Github
+# e.g. https://github.com/NREL/EnergyPlus/releases/download/v23.1.0/EnergyPlus-23.1.0-87ed9199d4-Linux-Ubuntu22.04-x86_64.sh
+ENV ENERGYPLUS_DOWNLOAD_BASE_URL=https://github.com/NREL/EnergyPlus/releases/download/$ENERGYPLUS_TAG
+ENV ENERGYPLUS_DOWNLOAD_FILENAME=EnergyPlus-$ENERGYPLUS_VERSION-$ENERGYPLUS_SHA-Linux-Ubuntu22.04-x86_64.sh 
+ENV ENERGYPLUS_DOWNLOAD_URL=$ENERGYPLUS_DOWNLOAD_BASE_URL/$ENERGYPLUS_DOWNLOAD_FILENAME
+# Python add pyenergyplus path in order to detect API package
+ENV PYTHONPATH="/usr/local/EnergyPlus-${ENERGYPLUS_INSTALL_VERSION}"
+
+# --------------------------------- SINERGYM --------------------------------- #
+
+# VERSION ARGUMENTS
+ARG SINERGYM_VERSION=3.6.2
+ARG SINERGYM_INSTALL_VERSION=3-6-2
+ARG SINERGYM_SHA=fe45bbc5b2
+
+#ENV CONFIGURATION
+ENV SINERGYM_TAG=v$SINERGYM_VERSION
+ENV SINERGYM_PATH=/usr/local/Sinergym-$SINERGYM_INSTALL_VERSION
+# Downloading from Github
+ENV SINERGYM_DOWNLOAD_BASE_URL=https://github.com/ugr-sail/sinergym/archive/refs/tags
+ENV SINERGYM_DOWNLOAD_FILENAME=$SINERGYM_TAG.tar.gz
+ENV SINERGYM_DOWNLOAD_URL=$SINERGYM_DOWNLOAD_BASE_URL/$SINERGYM_DOWNLOAD_FILENAME
+
+# ---------------------------------- PYTHON ---------------------------------- #
+
+# VERSION ARGUMENT
+ARG PYTHON_VERSION=3.12
+
+# ENV CONFIGURATION
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+
+# ---------------------------------- POETRY ---------------------------------- #
+
+# ENV CONFIGURATION
+ENV POETRY_NO_INTERACTION=1 
+ENV POETRY_VIRTUALENVS_IN_PROJECT=0
+ENV POETRY_VIRTUALENVS_CREATE=0
+ENV POETRY_CACHE_DIR=/tmp/poetry_cache
+
+
+# ------------------------- SINERGYM EXTRA LIBRERIES ------------------------- #
+
+ARG SINERGYM_EXTRAS=""
+
+# ------------------------- WANDB API KEY (IF EXISTS) ------------------------ #
+
+ARG WANDB_API_KEY
+ENV WANDB_API_KEY=${WANDB_API_KEY}
+
+# LC_ALL for python locale error (https://bobbyhadz.com/blog/locale-error-unsupported-locale-setting-in-python)
+ENV LC_ALL=C
+
+# ---------------------------------------------------------------------------- #
+#                        INSTALLATION AND CONFIGURATION                        #
+# ---------------------------------------------------------------------------- #
+
+# --------------------- APT UPDATE AND MANDATORY PACKAGES -------------------- #
+
+RUN apt update && apt upgrade -y
+RUN apt install -y ca-certificates build-essential curl libx11-6 libexpat1 git wget python3
+
+# -------------------------- ENERGYPLUS INSTALLATION ------------------------- #
+
+RUN curl -SLO $ENERGYPLUS_DOWNLOAD_URL \
+    && chmod +x $ENERGYPLUS_DOWNLOAD_FILENAME \
+    && echo "y\r" | ./$ENERGYPLUS_DOWNLOAD_FILENAME \
+    && rm $ENERGYPLUS_DOWNLOAD_FILENAME \
+    && cd /usr/local/EnergyPlus-$ENERGYPLUS_INSTALL_VERSION \
+    && rm -rf PostProcess/EP-Compare PreProcess/FMUParser PreProcess/ParametricPreProcessor PreProcess/IDFVersionUpdater \
+    # Remove the broken symlinks
+    && cd /usr/local/bin find -L . -type l -delete
+
+# --------------------------- SINERGYM INSTALLATION -------------------------- #
+
+RUN curl -SLO $SINERGYM_DOWNLOAD_URL \
+    && chmod +x $SINERGYM_DOWNLOAD_FILENAME \
+    && mkdir -p /workspaces/sinergym \
+    && tar -xzf $SINERGYM_DOWNLOAD_FILENAME -C /workspaces/sinergym --strip-components=1 \
+    && rm $SINERGYM_DOWNLOAD_FILENAME
+
+RUN sed -i 's/INFO/NOTSET/g' /workspaces/sinergym/sinergym/utils/constants.py
+RUN sed -i "s/logger.setLevel(logging.INFO)/logger.setLevel(logging.NOTSET)/g" /workspaces/sinergym/sinergym/utils/logger.py
+
+RUN sed -i 's/self.api.runtime.callback_progress(//g' /workspaces/sinergym/sinergym/simulators/eplus.py
+RUN sed -i 's/self.energyplus_state, _progress_update)//g' /workspaces/sinergym/sinergym/simulators/eplus.py
+
+# ------------------------ PYTHON AND PIP CONFIGURTION ----------------------- #
+
+RUN curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py \
+    && python3 get-pip.py \
+    && rm get-pip.py \
+    && pip install --upgrade pip setuptools wheel \
+    && ln -s /usr/bin/python3 /usr/bin/python \
+    # Install some apt dependencies
+    && echo "Y\r" | apt install python3-enchant -y \
+    && echo "Y\r" | apt install pandoc -y 
+
+# ---------------------------- POETRY CONFIGURTION --------------------------- #
+
+# Install Poetry
+RUN curl -sSL https://install.python-poetry.org | python3 -
+# Add Poetry to PATH
+ENV PATH="/root/.local/bin:$PATH"
+
+# ---------------------------- libgl1 CONFIGURTION --------------------------- #
+
+RUN apt-get install -y libgl1
+
+# -------------------------------- CLEAN FILES ------------------------------- #
+
+RUN apt autoremove -y && apt autoclean -y \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------- #
+#                    SINERGYM PACKAGE INSTALLATION (POETRY)                    #
+# ---------------------------------------------------------------------------- #
+
+RUN poetry install --no-interaction --only main --extras "$SINERGYM_EXTRAS" --directory /workspaces/sinergym
+
+# Execute the command
+# CMD ["python", "scripts/try_env.py"]
+
+# ---------------------------------------------------------------------------- #
+#                        FLOWER CLIENT INSTALLATION                            #
+# ---------------------------------------------------------------------------- #
+
+# Install Flower (client version)
+ARG FLWR_VERSION=1.11.1  # Adjust to the correct version
+#RUN pip install --upgrade pip
+#RUN pip install --upgrade setuptools
+RUN pip install flwr==${FLWR_VERSION}
+RUN pip install gymnasium
+RUN pip install wandb
+#RUN pip install tensorflow[and-cuda]
+RUN pip install stable-baselines3
+RUN pip install tqdm
+RUN pip install tqdm-joblib==0.0.4
+RUN pip install pydot
+
+# ---------------------------------------------------------------------------- #
+#                           GE_Q_DTs INSTALLATION                              #
+# ---------------------------------------------------------------------------- #
+
+# Install GE_Q_DTs required packages
+#RUN pip install setuptools==57.1.0
+
+RUN pip install pathos==0.2.6
+#0.7.1.1
+RUN pip install scoop==0.7.2.0
+#RUN pip install multiprocess==0.70.10 --config-settings --confirm-license= --verbose
+RUN pip install stopit==1.1.2
+#1.3.1
+RUN pip install deap==1.4.1
+RUN pip install joblib==0.17.0
+#4.4.0.42
+RUN pip install opencv_python==4.10.0.84
+#1.18.5
+RUN pip install numpy==1.26.4
+#3.1.2
+RUN pip install matplotlib==3.9.2
+
+ARG CLIENT_FOLDER=./client
+
+# Copy the GE_Q_DTs script into the container
+#COPY $CLIENT_FOLDER/GE_Q_DTs/advanced_test_oblique.py /app/advanced_test_oblique.py
+COPY $CLIENT_FOLDER/GE_Q_DTs/grammatical_evolution.py /app/grammatical_evolution.py
+#COPY $CLIENT_FOLDER/GE_Q_DTs/gym_evaluation.py /app/gym_evaluation.py
+#COPY $CLIENT_FOLDER/GE_Q_DTs/simple_test_orthogonal.py /app/simple_test_orthogonal.py
+
+COPY $CLIENT_FOLDER/GE_Q_DTs/dt/__init__.py /app/dt/__init__.py
+COPY $CLIENT_FOLDER/GE_Q_DTs/dt/decision_tree.py /app/dt/decision_tree.py
+COPY $CLIENT_FOLDER/GE_Q_DTs/dt/python_decision_tree.py /app/dt/python_decision_tree.py
+
+# ---------------------------------------------------------------------------- #
+#                            WORKDIR AND COPY FILES                            #
+# ---------------------------------------------------------------------------- #
+
+# Copy the sinergym confs script into the container
+COPY $CLIENT_FOLDER/sinergym_conf/constants.py /workspaces/sinergym/sinergym/utils/constants.py
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_au.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_au.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_co.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_co.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_col.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_col.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_fi_s.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_fi_s.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_il.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_il.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_jpn.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_jpn.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_mdg.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_mdg.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_pa.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_pa.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_pt_w.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_pt_w.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_sp_s.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_sp_s.json
+COPY $CLIENT_FOLDER/sinergym_conf/5ZoneAutoDXVAV_swe.json /workspaces/sinergym/sinergym/data/default_configuration/5ZoneAutoDXVAV_swe.json
+COPY $CLIENT_FOLDER/sinergym_conf/ESP_Granada.084190_SWEC.epw /workspaces/sinergym/sinergym/data/weather/ESP_Granada.084190_SWEC.epw
+
+# Copy the custom Flower client Python script into the container
+COPY $CLIENT_FOLDER/flwr_dr_client.py /app/flwr_dr_client.py
+COPY $CLIENT_FOLDER/flwr_dr_client_eval.py /app/flwr_dr_client_eval.py
+COPY $CLIENT_FOLDER/flwr_dr_client_only_hpc.py /app/flwr_dr_client_only_hpc.py
+
+# ---------------------------------------------------------------------------- #
+
+# Set the working directory
+WORKDIR /app
+RUN mkdir -p /app/logs/gym
+
+# Expose the necessary port for communication with the Flower server
+EXPOSE 8080
+
+# Run the entrypoint script when the container starts
+COPY $CLIENT_FOLDER/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["--default-arg"]
+
+
